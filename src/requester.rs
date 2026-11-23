@@ -14,7 +14,7 @@ use tokio::{
     io::{AsyncWriteExt, BufWriter},
     spawn,
     task::JoinHandle,
-    time::{sleep, sleep_until, Instant as TokioInstant},
+    time::{sleep, sleep_until, timeout_at, Instant as TokioInstant},
 };
 
 use crate::apis::METRIC_PERCENTILES;
@@ -233,16 +233,53 @@ async fn post_with_timeout<A: 'static + LLMApi + Send>(
         .body(json_body.clone())
         .header("Content-Type", "application/json");
 
-    if !stream {
-        req = req.timeout(timeout);
-    }
     for (name, value) in A::extra_headers(&json_body) {
         req = req.header(name, value);
     }
 
-    let response = req.send().await.map_err(|e| RequestError::Other(e))?;
+    let request_start = TokioInstant::now();
+    let mut metrics = timeout_at(request_start + timeout, async {
+        let response = req.send().await.map_err(RequestError::Other)?;
+        A::parse_response(response, request_start, stream, timeout, in_flight).await
+    })
+    .await
+    .map_err(|_| RequestError::Timeout)??;
 
-    A::parse_response(response, stream, timeout, in_flight).await
+    // Some backends report their measured count as output_length. Preserve it
+    // before the dispatch loop attaches the dataset's requested output_length.
+    if let Some(count) = metrics.get("output_length").cloned() {
+        metrics.entry("actual_output_tokens".to_string()).or_insert(count);
+    }
+    Ok(metrics)
+}
+
+fn actual_output_tokens(metrics: &BTreeMap<String, String>) -> Option<u64> {
+    ["actual_output_tokens", "token_count"]
+        .iter()
+        .find_map(|key| metrics.get(*key)?.parse().ok())
+}
+
+fn request_succeeded(metrics: &BTreeMap<String, String>) -> bool {
+    metrics.get("status").is_some_and(|s| s.starts_with('2'))
+        && !metrics.contains_key("stream_error")
+}
+
+fn record_normalized_e2e(metrics: &mut BTreeMap<String, String>, stream: bool, span_ms: f64) {
+    if !stream && request_succeeded(metrics) {
+        if let Some(count) = actual_output_tokens(metrics).filter(|&count| count > 0) {
+            let normalized_e2e = span_ms / count as f64;
+            metrics.insert("normalized_e2e".to_string(), format!("{normalized_e2e:.3}"));
+        }
+    }
+}
+
+async fn wait_for_trace_timestamp(trace_ms: u64, scale_factor: f64) -> f64 {
+    let scheduled_ms = trace_ms as f64 / scale_factor;
+    let delay_ms = scheduled_ms - get_timestamp();
+    if delay_ms > 0.0 {
+        sleep(Duration::from_secs_f64(delay_ms / 1000.0)).await;
+    }
+    scheduled_ms
 }
 
 async fn wait_all(handle_rx: flume::Receiver<JoinHandle<()>>, interrupt_flag: Arc<AtomicBool>) {
@@ -343,17 +380,14 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
             // ScaleAll: all requests (root AND child) are paced via scaled timestamp in the dispatch loop.
             // PreserveGap/ScaleGap: only root turns are paced here; child pacing is inside the spawned task.
             let dispatch_in_loop = !is_child_turn || track_output_timing == TrackOutputTiming::ScaleAll;
-            let scheduled_ts: f64 = if dispatch_in_loop {
-                let curr_timestamp = get_timestamp() as u64;
-                let next_timestamp =
-                    ((*dataset).timestamp(data_index) as f64 / scale_factor) as u64;
-                if next_timestamp > curr_timestamp + 1 {
-                    sleep(Duration::from_millis(next_timestamp - curr_timestamp)).await;
-                }
-                next_timestamp as f64
+            let scheduled_ts = if dispatch_in_loop {
+                wait_for_trace_timestamp(trace_ts, scale_factor).await
             } else {
                 0.0
             };
+            if interrupt_flag.load(Ordering::Relaxed) {
+                break;
+            }
 
             // Root turns: inflate prompt in the dispatch loop (no causal dependencies).
             // ScaleAll child turns: also inflate here — try Messages if ancestors are ready, else Content.
@@ -491,15 +525,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                             format!("{span_time:.3}"),
                         );
 
-                        if output_length > 0
-                            && metrics
-                                .get("status")
-                                .map(|s| s.starts_with('2'))
-                                .unwrap_or(false)
-                        {
-                            let normalized_e2e = span_time / output_length as f64;
-                            metrics.insert("normalized_e2e".to_string(), format!("{normalized_e2e:.3}"));
-                        }
+                        record_normalized_e2e(&mut metrics, stream, span_time);
 
                         // Always complete for output tracking (unblocks downstream turns).
                         if let Some(ref tos) = track_output_clone {
@@ -642,11 +668,9 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
             let endpoint = endpoint.clone();
             let response_sender = response_sender.clone();
 
-            let curr_timestamp = get_timestamp() as u64;
-            let next_timestamp = ((*dataset).timestamp(data_index) as f64 / scale_factor) as u64;
-
-            if next_timestamp > curr_timestamp + 1 {
-                sleep(Duration::from_millis(next_timestamp - curr_timestamp)).await;
+            let scheduled_ts = wait_for_trace_timestamp(trace_ts, scale_factor).await;
+            if interrupt_flag.load(Ordering::Relaxed) {
+                break;
             }
 
             let (prompt, input_length, output_length) =
@@ -660,7 +684,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
             let request_handle = spawn(async move {
                 let json_body = A::request_json_body(prompt, input_length, output_length, stream);
                 let s_time = get_timestamp();
-                let s_time_drift = s_time - next_timestamp as f64;
+                let s_time_drift = s_time - scheduled_ts;
                 match post_with_timeout::<A>(
                     client,
                     endpoint.as_str(),
@@ -686,15 +710,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                             format!("{span_time:.3}"),
                         );
 
-                        if output_length > 0
-                            && metrics
-                                .get("status")
-                                .map(|s| s.starts_with('2'))
-                                .unwrap_or(false)
-                        {
-                            let normalized_e2e = span_time / output_length as f64;
-                            metrics.insert("normalized_e2e".to_string(), format!("{normalized_e2e:.3}"));
-                        }
+                        record_normalized_e2e(&mut metrics, stream, span_time);
 
                         response_sender.send(metrics).unwrap();
                     }
@@ -1043,12 +1059,7 @@ pub fn spawn_request_loop_random_process<A: 'static + LLMApi + Send>(
                         metrics.insert("output_length".to_string(), output_length.to_string());
                         let span_time = e_time - s_time;
                         metrics.insert("span_time".to_string(), format!("{span_time:.3}"));
-                        if output_length > 0
-                            && metrics.get("status").map(|s| s.starts_with('2')).unwrap_or(false)
-                        {
-                            let normalized_e2e = span_time / output_length as f64;
-                            metrics.insert("normalized_e2e".to_string(), format!("{normalized_e2e:.3}"));
-                        }
+                        record_normalized_e2e(&mut metrics, stream, span_time);
                         response_sender.send(metrics).unwrap();
                     }
                     Err(RequestError::Timeout) => {
@@ -1424,18 +1435,7 @@ pub fn spawn_request_loop_feedback<A: 'static + LLMApi + Send>(
                         let span_time = e_time - s_time;
                         metrics
                             .insert("span_time".to_string(), format!("{span_time:.3}"));
-                        if output_length > 0
-                            && metrics
-                                .get("status")
-                                .map(|s| s.starts_with('2'))
-                                .unwrap_or(false)
-                        {
-                            let normalized_e2e = span_time / output_length as f64;
-                            metrics.insert(
-                                "normalized_e2e".to_string(),
-                                format!("{normalized_e2e:.3}"),
-                            );
-                        }
+                        record_normalized_e2e(&mut metrics, stream, span_time);
                         #[cfg(feature = "prompt-text-hashed")]
                         if let Some(ref tos) = track_output_clone {
                             let text = metrics.remove("output_text").unwrap_or_default();
@@ -1569,18 +1569,13 @@ impl SummaryStats {
     fn record(&mut self, metrics: &BTreeMap<String, String>) {
         self.total_requests += 1;
 
-        if let Some(status) = metrics.get("status") {
-            if status
-                .parse::<u16>()
-                .map(|code| (200..300).contains(&code))
-                .unwrap_or(false)
-            {
-                self.success_requests += 1;
+        let success = request_succeeded(metrics);
+        let output_tokens = actual_output_tokens(metrics);
+        if success {
+            self.success_requests += 1;
+            if let Some(count) = output_tokens {
+                self.total_output_tokens = self.total_output_tokens.saturating_add(count);
             }
-        }
-
-        if let Some(output_length) = metrics.get("output_length").and_then(|v| v.parse().ok()) {
-            self.total_output_tokens = self.total_output_tokens.saturating_add(output_length);
         }
 
         if let Some(s_time) = metrics.get("s_time").and_then(|v| v.parse().ok()) {
@@ -1589,34 +1584,31 @@ impl SummaryStats {
         if let Some(e_time) = metrics.get("e_time").and_then(|v| v.parse().ok()) {
             self.max_e_time = Some(self.max_e_time.map_or(e_time, |max| max.max(e_time)));
         }
+        if let Some(e2e) = metrics.get("span_time").and_then(|v| v.parse().ok()) {
+            self.e2e_values.push(e2e);
+        }
+        if !success {
+            return;
+        }
 
         if let Some(ttft) = metrics.get("first_token_time").and_then(|v| v.parse().ok()) {
             self.ttft_values.push(ttft);
         }
         if let Some(normalized_e2e) = metrics.get("normalized_e2e").and_then(|v| v.parse::<f64>().ok()) {
-            // Non-streaming: E2E span_time / output_length (includes TTFT, not true TPOT)
+            // Non-streaming: end-to-end latency per observed output token.
             self.tpot_values.push(normalized_e2e);
             if normalized_e2e > 0.0 {
                 self.tps_values.push(1000.0 / normalized_e2e);
             }
-        } else if let (Some(total_time), Some(token_count)) = (
+        } else if let (Some(total_time), Some(count)) = (
             metrics.get("total_time").and_then(|v| v.parse::<f64>().ok()),
-            metrics
-                .get("token_count")
-                .and_then(|v| v.parse::<f64>().ok()),
+            output_tokens.filter(|&count| count > 1),
         ) {
-            // Streaming: TPOT = decode_time / (actual_token_count - 1)
-            // total_time = last_token - first_token spans (N-1) inter-token gaps
-            if token_count > 1.0 {
-                let tpot = total_time / (token_count - 1.0);
+            if total_time > 0.0 {
+                let tpot = total_time / (count - 1) as f64;
                 self.tpot_values.push(tpot);
-                if tpot > 0.0 {
-                    self.tps_values.push(1000.0 / tpot);
-                }
+                self.tps_values.push(1000.0 / tpot);
             }
-        }
-        if let Some(e2e) = metrics.get("span_time").and_then(|v| v.parse().ok()) {
-            self.e2e_values.push(e2e);
         }
     }
 
@@ -1736,6 +1728,7 @@ mod tests {
     use tokio::fs::File;
 
     #[tokio::test]
+    #[ignore = "manual timing benchmark requiring BAILIAN_TRACE, TOKENIZER and TOKENIZER_CONFIG"]
     async fn test_inflate_latency() {
         // 初始化 tracing 输出
         let subscriber = tracing_subscriber::FmtSubscriber::builder()
@@ -1745,15 +1738,14 @@ mod tests {
 
         // ====== 准备 dataset ======
         let mut dataset = BailianDataset::new();
-        dataset.load("/Users/zdy/Workspace/Rust/request-sim/data/qwen-bailian-usagetraces-anon-main/qwen_traceA_blksz_16.jsonl"); // 你要准备一个小的测试文件
+        dataset.load(&std::env::var("BAILIAN_TRACE").unwrap());
 
         let dataset = Arc::new(Box::pin(dataset) as Pin<Box<dyn LLMTrace>>);
 
         // ====== 准备 TokenSampler ======
         let token_sampler = Arc::new(TokenSampler::new(
-            Tokenizer::from_file("/Users/zdy/Workspace/Rust/request-sim/data/tokenizer.json")
-                .unwrap(),
-            "/Users/zdy/Workspace/Rust/request-sim/data/tokenizer_config.json".to_string(),
+            Tokenizer::from_file(std::env::var("TOKENIZER").unwrap()).unwrap(),
+            std::env::var("TOKENIZER_CONFIG").unwrap(),
             4,   // num_producer
             128, // capacity
             16,  // block size
@@ -1761,6 +1753,7 @@ mod tests {
 
         // ====== 准备输出通道 ======
         let (tx, rx) = flume::unbounded();
+        tokio::fs::create_dir_all("tmp").await.unwrap();
         let output_file = File::create("tmp/inflate_latency.jsonl").await.unwrap();
         let summary_file = File::create("tmp/summary.json").await.unwrap();
         let reporter = tokio::spawn(report_loop(output_file, summary_file, rx));

@@ -6,7 +6,10 @@ use std::sync::{
 };
 
 use clap::Parser;
-use request_sim::apis::{OaiApi, SglApi, AIBRIX_ROUTE_STRATEGY, AMADEUS_ID, CONTEXT_LENGTH, MAX_TOKENS_CAP, METRIC_PERCENTILES, RID_SOURCE, RidSource};
+use request_sim::apis::{
+    OaiApi, RidSource, SglApi, AIBRIX_ROUTE_STRATEGY, AMADEUS_ID, CONTEXT_LENGTH,
+    DISABLE_THINKING, IGNORE_EOS, MAX_TOKENS_CAP, METRIC_PERCENTILES, RID_SOURCE,
+};
 use request_sim::cache::PromptCache;
 use request_sim::{
     apis::{TgiApi, MODEL_NAME},
@@ -196,12 +199,18 @@ struct Args {
     #[clap(long)]
     max_tokens: Option<u64>,
 
-    /// Model context window size (in tokens). When set and a request's
-    /// input_length + output_length exceeds this limit, min_tokens is omitted
-    /// from the request body to avoid server-side errors. max_tokens is kept
-    /// so the server can cap or reject as appropriate.
+    /// Model context window size (in tokens). For OpenAI, caps max_tokens
+    /// with room for the chat template and omits min_tokens.
     #[clap(long)]
     context_length: Option<u64>,
+
+    /// Ask vLLM to continue generation past EOS, up to the configured output cap.
+    #[clap(long)]
+    ignore_eos: bool,
+
+    /// Disable Qwen3 thinking via OpenAI chat_template_kwargs.
+    #[clap(long)]
+    disable_thinking: bool,
 
     /// Source for request rid (content identity).
     ///   none         — no rid in request body (default)
@@ -233,8 +242,8 @@ fn validate_config(args: &Args) {
     match args.mode.as_str() {
         "trace-replay" => {
             assert!(
-                args.scale_factor.is_some(),
-                "--scale-factor is required for trace-replay mode"
+                args.scale_factor.is_some_and(|scale| scale.is_finite() && scale > 0.0),
+                "--scale-factor must be positive and finite for trace-replay mode"
             );
         }
         "random-process" => {
@@ -341,6 +350,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
         all_tokens_limit,
         max_tokens,
         context_length,
+        ignore_eos,
+        disable_thinking,
         rid_source,
         amadeus_id,
         #[cfg(feature = "prompt-text-hashed")]
@@ -364,6 +375,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
     METRIC_PERCENTILES.get_or_init(|| metric_percentile);
     MAX_TOKENS_CAP.get_or_init(|| max_tokens);
     CONTEXT_LENGTH.get_or_init(|| context_length);
+    IGNORE_EOS.get_or_init(|| ignore_eos);
+    DISABLE_THINKING.get_or_init(|| disable_thinking);
     RID_SOURCE.get_or_init(|| match rid_source.as_str() {
         "none" => RidSource::None,
         "content-hash" => RidSource::ContentHash,
@@ -589,7 +602,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
     let time_range = (begin_time, end_time);
 
     // Dispatch: first resolve API type parameter, then match mode
-    let requester_handle = match api_lower.as_str() {
+    let mut requester_handle = match api_lower.as_str() {
         "release-with-debug" => spawn_request_loop_debug::<TgiApi>(
             endpoint,
             dataset,
@@ -876,11 +889,14 @@ async fn async_main(args: Args) -> Result<(), i32> {
     let reporter_handle = spawn(report_loop(output_file, summary_file, rx));
 
     // start test!
-    tokio::select! {
+    let ret_val = tokio::select! {
+        result = &mut requester_handle => result.unwrap(),
+
         // case 1: time up
         _ = tokio::time::sleep(tokio::time::Duration::from_secs(time_in_secs)) => {
             tracing::info!("Test finished by timeout");
             interrupt_flag.store(true, Ordering::SeqCst);
+            requester_handle.await.unwrap()
         }
 
         // case 2: interrupt from inner
@@ -890,10 +906,10 @@ async fn async_main(args: Args) -> Result<(), i32> {
             }
         } => {
             tracing::error!("Test early stop by interrupt_flag");
+            requester_handle.await.unwrap()
         }
-    }
+    };
 
-    let ret_val = requester_handle.await.unwrap();
     reporter_handle.await.unwrap();
     return ret_val;
 }

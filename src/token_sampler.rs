@@ -562,6 +562,7 @@ mod tests {
     /// ...
     /// ```
     #[test]
+    #[ignore = "manual tokenizer timing benchmark requiring data/tokenizer.json"]
     fn test_gen_string_latency_scaling() {
         // init tokenizer
         let tokenizer_path = "data/tokenizer.json"; // your own path

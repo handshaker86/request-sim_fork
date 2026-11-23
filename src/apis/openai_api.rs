@@ -1,15 +1,18 @@
-use super::{InFlightState, LLMApi, RequestError, CONTEXT_LENGTH, MAX_TOKENS_CAP, METRIC_PERCENTILES, MODEL_NAME, RID_SOURCE, RidSource, compute_content_hash_rid};
+use super::{
+    compute_content_hash_rid, InFlightState, LLMApi, RequestError, RidSource, CONTEXT_LENGTH,
+    DISABLE_THINKING, IGNORE_EOS, MAX_TOKENS_CAP, METRIC_PERCENTILES, MODEL_NAME, RID_SOURCE,
+};
 use crate::dataset::PromptPayload;
 use futures_util::TryStreamExt;
 use reqwest::Response;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
-    time::{timeout as tokio_timeout, Instant as TokioInstant},
+    time::{timeout_at, Instant},
 };
 use tokio_util::io::StreamReader;
 
@@ -17,10 +20,39 @@ use tokio_util::io::StreamReader;
 pub struct OaiApi;
 
 const DEFAULT_PERCENTILES: [u32; 3] = [90, 95, 99];
+// Reserve room for Qwen chat role markers and the assistant generation prefix.
+const CHAT_TEMPLATE_MARGIN: u64 = 32;
+
+fn record_usage(result: &mut BTreeMap<String, String>, response: &Value) {
+    for (path, metric) in [
+        ("/usage/prompt_tokens", "prompt_tokens"),
+        ("/usage/completion_tokens", "actual_output_tokens"),
+        (
+            "/usage/prompt_tokens_details/cached_tokens",
+            "cached_tokens",
+        ),
+    ] {
+        if let Some(count) = response.pointer(path).and_then(Value::as_u64) {
+            result.insert(metric.to_string(), count.to_string());
+        }
+    }
+    if response
+        .pointer("/usage/completion_tokens")
+        .and_then(Value::as_u64)
+        .is_some()
+    {
+        result.insert("output_tokens_source".to_string(), "usage".to_string());
+    }
+}
 
 #[async_trait::async_trait]
 impl LLMApi for OaiApi {
-    fn request_json_body(prompt: PromptPayload, input_length: u64, output_length: u64, stream: bool) -> String {
+    fn request_json_body(
+        prompt: PromptPayload,
+        input_length: u64,
+        output_length: u64,
+        stream: bool,
+    ) -> String {
         let messages = match prompt {
             PromptPayload::Content(text) => json!([{"role": "user", "content": text}]),
             PromptPayload::Messages(val) => val,
@@ -31,16 +63,34 @@ impl LLMApi for OaiApi {
             "messages": messages,
             "stream": stream,
         });
-        if output_length > 0 {
-            let exceeds_ctx = CONTEXT_LENGTH.get()
-                .and_then(|opt| opt.as_ref())
-                .is_some_and(|ctx| input_length + output_length > *ctx);
-            if !exceeds_ctx {
+        if stream {
+            body["stream_options"] = json!({"include_usage": true});
+        }
+        let ignore_eos = IGNORE_EOS.get() == Some(&true);
+        if ignore_eos {
+            body["ignore_eos"] = json!(true);
+        }
+        if DISABLE_THINKING.get() == Some(&true) {
+            body["chat_template_kwargs"] = json!({"enable_thinking": false});
+        }
+
+        let context_length = CONTEXT_LENGTH.get().copied().flatten();
+        let requested_max = if output_length > 0 {
+            Some(output_length)
+        } else {
+            MAX_TOKENS_CAP.get().copied().flatten()
+        };
+        if let Some(mut max_tokens) = requested_max {
+            if let Some(context_length) = context_length {
+                let available = context_length
+                    .saturating_sub(input_length)
+                    .saturating_sub(CHAT_TEMPLATE_MARGIN)
+                    .max(1);
+                max_tokens = max_tokens.min(available);
+            } else if output_length > 0 && !ignore_eos {
                 body["min_tokens"] = json!(output_length);
             }
-            body["max_tokens"] = json!(output_length);
-        } else if let Some(Some(cap)) = MAX_TOKENS_CAP.get() {
-            body["max_tokens"] = json!(cap);
+            body["max_tokens"] = json!(max_tokens);
         }
 
         if RID_SOURCE.get() == Some(&RidSource::ContentHash) {
@@ -52,6 +102,7 @@ impl LLMApi for OaiApi {
 
     async fn parse_response(
         response: Response,
+        request_start: Instant,
         stream: bool,
         timeout_duration: Duration,
         in_flight: Option<Arc<InFlightState>>,
@@ -62,7 +113,8 @@ impl LLMApi for OaiApi {
         if !stream {
             if response.status().is_success() {
                 if let Ok(body) = response.text().await {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                    if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                        record_usage(&mut result, &v);
                         // Extract output text from non-streaming response
                         if let Some(content) = v
                             .get("choices")
@@ -79,7 +131,6 @@ impl LLMApi for OaiApi {
             return Ok(result);
         }
 
-        // 流式响应处理
         if !response.status().is_success() {
             return Ok(result);
         }
@@ -90,115 +141,99 @@ impl LLMApi for OaiApi {
         );
         let mut reader = BufReader::new(stream_reader);
         let mut line = String::new();
-        let mut first_token_time: Option<TokioInstant> = None;
-        let mut last_token_time: Option<TokioInstant> = None;
+        let mut first_token_time = None;
+        let mut last_token_time = None;
         let mut token_count = 0;
         let mut tbt_values: Vec<f64> = Vec::new();
         let mut tbt_except_first: Vec<f64> = Vec::new();
-        let start_time = TokioInstant::now();
+        let deadline = request_start + timeout_duration;
 
         // Accumulate generated text for output tracking
         let mut output_text = String::new();
 
         loop {
-            if start_time.elapsed() > timeout_duration {
-                return Err(RequestError::Timeout);
+            line.clear();
+            let bytes_read = timeout_at(deadline, reader.read_line(&mut line))
+                .await
+                .map_err(|_| RequestError::Timeout)?
+                .map_err(RequestError::StreamErr)?;
+            if bytes_read == 0 {
+                break;
             }
-            let remaining_duration = timeout_duration - start_time.elapsed();
+            let Some(data) = line.trim().strip_prefix("data:").map(str::trim_start) else {
+                continue;
+            };
+            if data == "[DONE]" {
+                break;
+            }
 
-            let read_future = reader.read_line(&mut line);
-            match tokio_timeout(remaining_duration, read_future).await {
-                Ok(Ok(0)) => break, // EOF
-                Ok(Ok(_)) => {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        line.clear();
-                        continue;
-                    }
+            let received_at = Instant::now();
+            let Ok(chunk) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            if let Some(error) = chunk.get("error").filter(|error| !error.is_null()) {
+                result.insert("stream_error".to_string(), error.to_string());
+                break;
+            }
+            if chunk.get("usage").is_some_and(Value::is_object) {
+                record_usage(&mut result, &chunk);
+            }
 
-                    if let Some(rest) = trimmed.strip_prefix("data:") {
-                        // SSE spec allows both "data: ..." and "data:..." (no space).
-                        // axum's Sse Event omits the space; vLLM includes it.
-                        // Accept both — strip the colon, then trim leading whitespace.
-                        let data_str = rest.trim_start();
-                        if data_str == "[DONE]" {
-                            break;
-                        }
-                        if data_str.contains(r#""delta""#) {
-                            // Parse the delta object once: needed both for role-only
-                            // detection and for content text accumulation.
-                            let delta = serde_json::from_str::<serde_json::Value>(data_str)
-                                .ok()
-                                .and_then(|v| v.pointer("/choices/0/delta").cloned());
+            let Some(delta) = chunk.pointer("/choices/0/delta") else {
+                continue;
+            };
+            let content = delta.get("content").and_then(Value::as_str).unwrap_or("");
+            let has_reasoning = ["reasoning_content", "reasoning"].iter().any(|field| {
+                delta
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+            });
+            if content.is_empty() && !has_reasoning {
+                continue;
+            }
+            output_text.push_str(content);
+            token_count += 1;
 
-                            // OAI chat-completion streams open with a role-announcement
-                            // chunk (typically `{"role":"assistant","content":""}`) that
-                            // carries no generated content. Counting it would inflate
-                            // token_count and pull first_token_time down to the
-                            // time-to-role-chunk (network + queue admission) rather than
-                            // time-to-first-decoded-token. Skip when `role` is present
-                            // and `content` is missing / null / empty.
-                            if let Some(d) = delta.as_ref() {
-                                let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                                let has_role = d.get("role").is_some();
-                                if has_role && content.is_empty() {
-                                    line.clear();
-                                    continue;
-                                }
-                            }
-
-                            // Extract delta.content for output text accumulation
-                            if let Some(d) = delta.as_ref() {
-                                if let Some(content) = d.get("content").and_then(|c| c.as_str()) {
-                                    output_text.push_str(content);
-                                }
-                            }
-
-                            let now = TokioInstant::now();
-                            token_count += 1;
-
-                            // Update in-flight state for controller observation
-                            if let Some(ref state) = in_flight {
-                                state.output_tokens_so_far.fetch_add(1, Ordering::Relaxed);
-                                if token_count == 1 {
-                                    let ts = crate::get_timestamp() as u64;
-                                    let _ = state.first_token_time_ms.compare_exchange(
-                                        0, ts, Ordering::Release, Ordering::Relaxed,
-                                    );
-                                }
-                            }
-
-                            if first_token_time.is_none() {
-                                first_token_time = Some(now);
-                                let first_token_duration =
-                                    now.duration_since(start_time).as_secs_f64() * 1000.0;
-                                result.insert(
-                                    "first_token_time".to_string(),
-                                    format!("{first_token_duration:.3}"),
-                                );
-                            } else if let Some(last) = last_token_time {
-                                let tbt = now.duration_since(last).as_secs_f64() * 1000.0;
-                                tbt_values.push(tbt);
-                                if token_count > 2 {
-                                    tbt_except_first.push(tbt);
-                                }
-                            }
-
-                            last_token_time = Some(now);
-                        }
-                    }
-                    line.clear();
+            if let Some(state) = &in_flight {
+                state.output_tokens_so_far.fetch_add(1, Ordering::Relaxed);
+                if token_count == 1 {
+                    let timestamp = crate::get_timestamp() as u64;
+                    state
+                        .first_token_time_ms
+                        .store(timestamp, Ordering::Release);
                 }
-                Ok(Err(e)) => return Err(RequestError::StreamErr(e)),
-                Err(_) => return Err(RequestError::Timeout),
             }
+
+            if let Some(last) = last_token_time {
+                let tbt = received_at.duration_since(last).as_secs_f64() * 1000.0;
+                tbt_values.push(tbt);
+                if token_count > 2 {
+                    tbt_except_first.push(tbt);
+                }
+            } else {
+                first_token_time = Some(received_at);
+                let ttft_ms = received_at.duration_since(request_start).as_secs_f64() * 1000.0;
+                result.insert("first_token_time".to_string(), format!("{ttft_ms:.3}"));
+            }
+            last_token_time = Some(received_at);
         }
 
-        if let Some(first) = first_token_time {
-            if let Some(last) = last_token_time {
-                let total_time = last.duration_since(first).as_secs_f64() * 1000.0;
-                result.insert("total_time".to_string(), format!("{total_time:.3}"));
-            }
+        if let Some((first, last)) = first_token_time.zip(last_token_time) {
+            let total_time = last.duration_since(first).as_secs_f64() * 1000.0;
+            result.insert("total_time".to_string(), format!("{total_time:.3}"));
+        }
+        if !result.contains_key("actual_output_tokens") {
+            result.insert("actual_output_tokens".to_string(), token_count.to_string());
+            result.insert("output_tokens_source".to_string(), "sse_delta".to_string());
+        }
+        if let Some(state) = &in_flight {
+            let actual_output_tokens = result["actual_output_tokens"]
+                .parse()
+                .unwrap_or(token_count);
+            state
+                .output_tokens_so_far
+                .store(actual_output_tokens, Ordering::Relaxed);
         }
         result.insert("token_count".to_string(), token_count.to_string());
 
@@ -207,10 +242,7 @@ impl LLMApi for OaiApi {
         }
 
         if !tbt_except_first.is_empty() {
-            let max_tbt_except_first = tbt_except_first
-                .iter()
-                .copied()
-                .fold(f64::MIN, f64::max);
+            let max_tbt_except_first = tbt_except_first.iter().copied().fold(f64::MIN, f64::max);
             result.insert(
                 "max_time_between_tokens_except_first".to_string(),
                 format!("{max_tbt_except_first:.3}"),
@@ -237,7 +269,8 @@ impl LLMApi for OaiApi {
         // need to sort for computing percentage
         if !tbt_values.is_empty() {
             let mut sorted_tbt = tbt_values.clone();
-            sorted_tbt.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            sorted_tbt
+                .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
             let len = sorted_tbt.len();
             if len > 0 {

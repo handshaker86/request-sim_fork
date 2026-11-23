@@ -44,6 +44,7 @@ impl LLMApi for TgiApi {
 
     async fn parse_response(
         response: Response,
+        _request_start: tokio::time::Instant,
         _stream: bool,
         _timeout_duration: Duration,
         _in_flight: Option<Arc<InFlightState>>,

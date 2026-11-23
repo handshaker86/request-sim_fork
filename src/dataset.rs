@@ -100,7 +100,7 @@ pub(crate) struct BailianDataItem {
 #[cfg(feature = "prompt-text-hashed")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MooncakeDataItem {
-    pub timestamp: f32,
+    pub timestamp: f64,
     pub input_length: u64,
     pub output_length: u64,
     pub hash_ids: Vec<u64>,
@@ -554,13 +554,19 @@ impl LLMTrace for MooncakeDataset {
     }
 
     fn rps(&self) -> f64 {
-        self.items.len() as f64
-            / (self.items.last().unwrap().timestamp as f64
-                - self.items.first().unwrap().timestamp as f64)
+        let Some((first, last)) = self.items.first().zip(self.items.last()) else {
+            return 0.0;
+        };
+        let elapsed_ms = last.timestamp - first.timestamp;
+        if elapsed_ms > 0.0 {
+            self.items.len() as f64 * 1000.0 / elapsed_ms
+        } else {
+            0.0
+        }
     }
 
     fn timestamp(&self, index: usize) -> u64 {
-        (self.items[index].timestamp * 1000.) as u64
+        self.items[index].timestamp as u64
     }
 
     fn inflate(&self, index: usize, ts: &TokenSampler) -> (PromptPayload, u64, u64) {
@@ -607,6 +613,48 @@ impl LLMTrace for MooncakeDataset {
 
             (PromptPayload::Content(prompt), (*data_item).input_length, (*data_item).output_length)
         }
+    }
+}
+
+#[cfg(all(test, feature = "prompt-text-hashed"))]
+mod timestamp_tests {
+    use super::*;
+
+    #[test]
+    fn mooncake_timestamps_are_milliseconds_and_rps_is_per_second() {
+        let mut dataset = MooncakeDataset::new();
+        for timestamp in [0, 142, 3_600_000] {
+            let line = format!(
+                r#"{{"timestamp":{timestamp},"input_length":512,"output_length":8,"hash_ids":[1]}}"#
+            );
+            dataset.items.push(serde_json::from_str(&line).unwrap());
+        }
+
+        assert_eq!(dataset.timestamp(0), 0);
+        assert_eq!(dataset.timestamp(1), 142);
+        assert_eq!(dataset.timestamp(2), 3_600_000);
+        assert!((dataset.rps() - 3.0 / 3600.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn bailian_still_converts_seconds_to_milliseconds() {
+        let mut dataset = BailianDataset::new();
+        for timestamp in [0.0, 0.142, 2.0] {
+            dataset.items.push(BailianDataItem {
+                chat_id: -1,
+                parent_chat_id: -1,
+                timestamp,
+                input_length: 16,
+                output_length: 8,
+                r#type: String::new(),
+                turn: 0,
+                hash_ids: vec![1],
+            });
+        }
+
+        assert_eq!(dataset.timestamp(1), 142);
+        assert_eq!(dataset.timestamp(2), 2000);
+        assert_eq!(dataset.rps(), 1.5);
     }
 }
 

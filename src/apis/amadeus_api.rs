@@ -86,6 +86,7 @@ impl LLMApi for AmadeusApi {
 
     async fn parse_response(
         response: Response,
+        _request_start: TokioInstant,
         stream: bool,
         timeout_duration: Duration,
         in_flight: Option<Arc<InFlightState>>,

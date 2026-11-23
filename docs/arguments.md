@@ -65,7 +65,9 @@ Without any constraint args (`--tpot-limit`, `--tps-limit`, `--all-tokens-limit`
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `--max-tokens` | `u64` | None | Safety cap on output tokens. Applied only when the dataset has no `output_length` (e.g. `plaintext`). Ignored when trace provides explicit `output_length` |
-| `--context-length` | `u64` | None | Model context window (tokens). When `input_length + output_length` exceeds this, `min_tokens` is omitted from request body to avoid server-side 400 errors |
+| `--context-length` | `u64` | None | For OpenAI, cap requested `max_tokens` at the model window minus the dataset input length and a 32-token chat template margin, with a minimum cap of one token. Omit `min_tokens` so the server can enforce its own limits |
+| `--ignore-eos` | `bool` | `false` | Send `ignore_eos: true` to vLLM through the OpenAI API and omit `min_tokens` |
+| `--disable-thinking` | `bool` | `false` | Set `chat_template_kwargs.enable_thinking` to `false` in OpenAI requests for Qwen3 |
 
 ## Streaming
 

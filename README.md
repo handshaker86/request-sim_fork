@@ -84,6 +84,38 @@ cargo build --release --features prompt-text-plain -j64
 - **random-process**: stochastic inter-arrival times (`--arrival poisson|uniform`, `--rate` req/s). Cycles dataset indefinitely; terminates on `--time-in-secs` only.
 - **feedback**: AIMD closed-loop controller probes concurrency from 1 toward `--bs-limit`, retreating when constraints (`--tpot-limit`, `--tps-limit`, `--all-tokens-limit`) are violated.
 
+### FAST'25 Mooncake with vLLM 0.13.0
+
+Both FAST'25 traces use millisecond arrival timestamps. At `--scale-factor 1.0`,
+the tool and agent trace replays at about 6.675 req/s and the conversation trace
+at about 3.401 req/s, each over a 3,536.999-second arrival window.
+[Mooncake FAST'25 trace release](https://github.com/kvcache-ai/Mooncake/tree/main/FAST25-release)
+
+For full-trace replay with Qwen3-30B-A3B, the largest input plus target output
+is 126,527 tokens before chat templating. Configure vLLM for a 131,072-token
+context with YaRN. Enable `--enable-prompt-tokens-details` for cached-token
+usage and `--reasoning-parser qwen3` to expose reasoning deltas.
+[Qwen3 long-context configuration](https://huggingface.co/Qwen/Qwen3-30B-A3B#processing-long-texts),
+[vLLM 0.13.0 chat serving](https://github.com/vllm-project/vllm/blob/v0.13.0/vllm/entrypoints/openai/serving_chat.py)
+
+```bash
+trace=toolagent_trace
+# Use trace=conversation_trace for the conversation workload.
+./target/release/request-sim \
+  --dataset mooncake --dataset-path "${trace}.jsonl" \
+  --tokenizer tokenizer.json --tokenizer-config tokenizer_config.json \
+  --mode trace-replay --scale-factor 1.0 --time-in-secs 3700 \
+  --api openai --endpoint http://localhost:8000/v1/chat/completions \
+  --model-name Qwen/Qwen3-30B-A3B --context-length 131072 \
+  --stream --ignore-eos \
+  --cache file --cache-path "${trace}.prompts.bin" \
+  --output-path "${trace}.results.jsonl"
+```
+
+Use the serving model's tokenizer files. The prompt cache moves synthetic
+prompt construction before the replay clock starts. `--ignore-eos` lets
+generation continue past EOS toward the trace target. Add `--disable-thinking`
+to run the workload in Qwen3's non-thinking mode.
 
 ## Prompt Text Modes
 
@@ -116,10 +148,16 @@ Results are written to the JSONL file specified by `--output-path`. Each line co
 | `status` | HTTP status code |
 | `s_time_drift` | Deviation between scheduled and actual send time (ms, expect < 5ms) |
 | `s_time` / `e_time` | Send and end timestamps |
-| `input_length` / `output_length` | Token counts |
+| `input_length` / `output_length` | Dataset prompt length and target generation length |
 | `span_time` | End-to-end latency (ms) |
+| `first_token_time` | OpenAI SSE latency from HTTP send start to the first non-empty content or reasoning delta (ms) |
+| `actual_output_tokens` | Reported generation count from server usage, with an SSE delta count as fallback |
+| `output_tokens_source` | OpenAI count source, either `usage` or `sse_delta` (one count per non-empty delta) |
+| `prompt_tokens` / `cached_tokens` | Server usage counts when supplied. vLLM 0.13.0 omits cached-token details for zero hits |
 
-Additional fields vary by API (TTFT, TPOT, etc.). A percentile summary is written to `--summary-path`.
+Additional fields vary by API. The summary at `--summary-path` computes
+`throughput_tps` from observed output tokens on successful requests divided
+by the measured run duration.
 
 
 ## Documentation

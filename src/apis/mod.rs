@@ -2,6 +2,7 @@ use reqwest::Response;
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};
+use tokio::time::Instant;
 
 use crate::dataset::PromptPayload;
 
@@ -9,6 +10,8 @@ pub static MODEL_NAME: OnceLock<String> = OnceLock::new();
 pub static METRIC_PERCENTILES: OnceLock<Vec<u32>> = OnceLock::new();
 pub static MAX_TOKENS_CAP: OnceLock<Option<u64>> = OnceLock::new();
 pub static CONTEXT_LENGTH: OnceLock<Option<u64>> = OnceLock::new();
+pub static IGNORE_EOS: OnceLock<bool> = OnceLock::new();
+pub static DISABLE_THINKING: OnceLock<bool> = OnceLock::new();
 pub static RID_SOURCE: OnceLock<RidSource> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +70,7 @@ pub trait LLMApi: Copy + Clone + Send + Sync {
 
     async fn parse_response(
         response: Response,
+        request_start: Instant,
         stream: bool,
         timeout_duration: Duration,
         in_flight: Option<Arc<InFlightState>>,

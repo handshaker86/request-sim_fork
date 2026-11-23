@@ -17,8 +17,8 @@ src/apis/xxx_api.rs
 3. Implement the `LLMApi` trait:
 
    * **`request_json_body`**: Construct the HTTP request body
-   * **`parse_response`**: Parse the HTTP response and extract metrics
-     (refer to `TGIApi` for examples)
+   * **`parse_response`** parses the HTTP response and receives `request_start`,
+     the monotonic timestamp captured immediately before the HTTP send.
 4. In `client.rs`, instantiate
    `spawn_request_loop_with_timestamp<T>` using the new API struct as the
    generic parameter.
